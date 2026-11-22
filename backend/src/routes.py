@@ -4,15 +4,25 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .database import redis_client
-from .models import AuditLog, AnalysisJob, ContainerCheck, DelayCase, DispatchAction, GateEvent, User, VesselCall
-from .schemas import ContainerIn, CustomsUpdate, DelayCaseIn, DispatchIn, GateIn, LoginIn, VesselIn
+from .models import AuditLog, AnalysisJob, ContainerCheck, DelayCase, DispatchAction, GateEvent, ThresholdVersion, User, VesselCall
+from .schemas import ContainerIn, CustomsUpdate, DelayCaseIn, DispatchIn, GateIn, LoginIn, ReviewIn, ThresholdIn, VesselIn
 from .security import current_user, get_db, hash_password, issue_token, require_roles
 from .services import build_features, domain_precheck
+from .thresholds import LEVELS, WITHDRAWN, dispatchable_levels, effective_version, next_version
 
 router = APIRouter(prefix="/api")
 
 def log(db, user, action, entity, entity_id=None, detail=""):
     db.add(AuditLog(actor=user.username, role=user.role, action=action, entity=entity, entity_id=entity_id, detail=detail))
+
+def threshold_dict(t: ThresholdVersion):
+    return {"version": t.version, "value": t.value, "status": t.status, "note": t.note, "published_by": t.published_by, "published_at": t.published_at.isoformat(), "withdrawn_by": t.withdrawn_by, "withdrawn_at": t.withdrawn_at.isoformat() if t.withdrawn_at else None}
+
+def threshold_state(db):
+    rows = db.execute(select(ThresholdVersion).order_by(ThresholdVersion.version.desc())).scalars().all()
+    current_no = effective_version([(t.version, t.status) for t in rows])
+    current = next((t for t in rows if t.version == current_no), None)
+    return current, rows
 
 def vessel_dict(v: VesselCall, db):
     features, issues = domain_precheck(db, v)
@@ -21,7 +31,10 @@ def vessel_dict(v: VesselCall, db):
 def case_dict(c: DelayCase, db):
     jobs = db.execute(select(AnalysisJob).where(AnalysisJob.case_id == c.id).order_by(AnalysisJob.id.desc())).scalars().all()
     actions = [{"id": a.id, "action_type": a.action_type, "assignee": a.assignee, "due_at": a.due_at.isoformat(), "status": a.status, "instruction": a.instruction} for a in c.actions]
-    return {"id": c.id, "case_no": c.case_no, "vessel_id": c.vessel_id, "vessel": c.vessel.call_no if c.vessel else "", "vessel_name": c.vessel.vessel_name if c.vessel else "", "requested_level": c.requested_level, "final_level": c.final_level, "status": c.status, "reason": c.reason, "feature_snapshot": c.feature_snapshot, "model_output": c.model_output, "exception_reason": c.exception_reason, "jobs": [{"id": j.id, "status": j.status, "result": j.result, "error": j.error, "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs], "actions": actions}
+    threshold = None
+    if c.threshold_bound_at is not None:
+        threshold = {"version": c.threshold_version, "value": c.threshold_value, "bound_at": c.threshold_bound_at.isoformat()}
+    return {"id": c.id, "case_no": c.case_no, "vessel_id": c.vessel_id, "vessel": c.vessel.call_no if c.vessel else "", "vessel_name": c.vessel.vessel_name if c.vessel else "", "requested_level": c.requested_level, "final_level": c.final_level, "status": c.status, "reason": c.reason, "feature_snapshot": c.feature_snapshot, "model_output": c.model_output, "exception_reason": c.exception_reason, "threshold": threshold, "confidence": (c.model_output or {}).get("confidence"), "dispatchable_levels": dispatchable_levels(c.status, c.final_level), "reviewed_by": c.reviewed_by, "reviewed_at": c.reviewed_at.isoformat() if c.reviewed_at else None, "jobs": [{"id": j.id, "status": j.status, "result": j.result, "error": j.error, "finished_at": j.finished_at.isoformat() if j.finished_at else None} for j in jobs], "actions": actions}
 
 @router.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
@@ -108,17 +121,67 @@ def create_case(payload: DelayCaseIn, db: Session = Depends(get_db), user: User 
 def classify(case_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
     case = db.get(DelayCase, case_id)
     if not case: raise HTTPException(404, "延误案件不存在")
+    if case.status in {"queued", "running"}: raise HTTPException(409, "分级任务已在队列中，请等待模型结果")
+    if case.status in {"classified", "dispatched"}: raise HTTPException(409, "案件已完成分级")
+    if case.status == "review": raise HTTPException(409, "案件待主管核级，不能重复提交分级")
     features, issues = domain_precheck(db, case.vessel)
     case.feature_snapshot = features
     if issues:
         case.status = "blocked"; case.exception_reason = "；".join(issues); case.updated_at = datetime.now(timezone.utc)
         log(db, user, "triage_blocked", "delay_case", case.id, case.exception_reason); db.commit()
         raise HTTPException(status_code=409, detail={"code": "DOMAIN_PRECHECK", "message": case.exception_reason, "case": case_dict(case, db)})
+    # 受理分级：与并发发布的门槛在同一事务内读取并绑定，按受理时生效的版本判断；
+    # 已绑定过（含推理失败后的重试）保持原版本不变
+    if case.threshold_bound_at is None:
+        current, _ = threshold_state(db)
+        if current:
+            case.threshold_version = current.version
+            case.threshold_value = current.value
+        case.threshold_bound_at = datetime.now(timezone.utc)
     case.status = "queued"; case.exception_reason = None
     job = AnalysisJob(case_id=case.id, status="queued", input_summary=features)
     db.add(job); db.flush(); log(db, user, "triage_queued", "analysis_job", job.id, json.dumps(features, ensure_ascii=False)); db.commit()
     redis_client.rpush("container_delay_triage_jobs", str(job.id))
     return {"case": case_dict(case, db), "job_id": job.id, "message": "已排入交叉特征分级队列"}
+
+@router.post("/cases/{case_id}/review")
+def review_case(case_id: int, payload: ReviewIn, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    case = db.get(DelayCase, case_id)
+    if not case: raise HTTPException(404, "延误案件不存在")
+    if case.status != "review": raise HTTPException(409, "只有置信度低于门槛、待核级的案件才能核级")
+    level = payload.final_level.strip().lower()
+    if level not in LEVELS: raise HTTPException(422, f"核级等级必须是：{' / '.join(LEVELS)}")
+    case.final_level = level; case.status = "classified"
+    case.reviewed_by = user.username; case.reviewed_at = datetime.now(timezone.utc)
+    detail = f"核级为 {level}（模型置信度 {(case.model_output or {}).get('confidence')}，门槛 v{case.threshold_version}={case.threshold_value}）"
+    if payload.note: detail += f"；{payload.note}"
+    log(db, user, "review_delay_case", "delay_case", case.id, detail); db.commit()
+    return case_dict(case, db)
+
+@router.get("/thresholds")
+def list_thresholds(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    current, rows = threshold_state(db)
+    return {"current": threshold_dict(current) if current else None, "versions": [threshold_dict(t) for t in rows]}
+
+@router.post("/thresholds")
+def publish_threshold(payload: ThresholdIn, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    _, rows = threshold_state(db)
+    version = next_version([t.version for t in rows])
+    t = ThresholdVersion(version=version, value=payload.value, note=payload.note.strip(), published_by=user.username)
+    db.add(t); db.flush()
+    log(db, user, "publish_threshold", "threshold_version", t.id, f"v{version}={payload.value} {payload.note.strip()}"); db.commit()
+    current, rows = threshold_state(db)
+    return {"current": threshold_dict(current), "versions": [threshold_dict(x) for x in rows]}
+
+@router.post("/thresholds/{version}/withdraw")
+def withdraw_threshold(version: int, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    t = db.execute(select(ThresholdVersion).where(ThresholdVersion.version == version)).scalar_one_or_none()
+    if not t: raise HTTPException(404, "门槛版本不存在")
+    if t.status == WITHDRAWN: raise HTTPException(409, "该版本已撤回")
+    t.status = WITHDRAWN; t.withdrawn_by = user.username; t.withdrawn_at = datetime.now(timezone.utc)
+    log(db, user, "withdraw_threshold", "threshold_version", t.id, f"v{t.version}={t.value}（已受理案件仍按原快照判断）"); db.commit()
+    current, rows = threshold_state(db)
+    return {"current": threshold_dict(current) if current else None, "versions": [threshold_dict(x) for x in rows]}
 
 @router.post("/cases/{case_id}/actions")
 def create_action(case_id: int, payload: DispatchIn, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):

@@ -57,6 +57,18 @@ class GateEvent(Base):
     note: Mapped[str] = mapped_column(String(240), default="")
     container: Mapped[ContainerCheck] = relationship(back_populates="gates")
 
+class ThresholdVersion(Base):
+    __tablename__ = "threshold_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, unique=True)
+    value: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(20), default="published")
+    note: Mapped[str] = mapped_column(String(200), default="")
+    published_by: Mapped[str] = mapped_column(String(40))
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    withdrawn_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
 class DelayCase(Base):
     __tablename__ = "delay_cases"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -69,6 +81,12 @@ class DelayCase(Base):
     feature_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     model_output: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     exception_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 分级受理时绑定的门槛快照；绑定后不再变化（失败重试、门槛撤回都不影响）
+    threshold_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    threshold_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    threshold_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
     vessel: Mapped[VesselCall] = relationship(back_populates="cases")

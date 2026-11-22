@@ -45,3 +45,11 @@ class DispatchIn(BaseModel):
 
 class CustomsUpdate(BaseModel):
     customs_status: str
+
+class ThresholdIn(BaseModel):
+    value: float = Field(ge=0, le=1)
+    note: str = Field(default="", max_length=200)
+
+class ReviewIn(BaseModel):
+    final_level: str
+    note: str = Field(default="", max_length=500)

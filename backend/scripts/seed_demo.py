@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 from src.database import Base, SessionLocal, engine
-from src.models import User, VesselCall, ContainerCheck, GateEvent, DelayCase, DispatchAction
+from src.models import User, VesselCall, ContainerCheck, GateEvent, DelayCase, DispatchAction, ThresholdVersion
 from src.security import hash_password
 
 
@@ -71,6 +71,8 @@ def seed():
         if not db.execute(select(DispatchAction).where(DispatchAction.action_type == "查验单证补录")).scalar_one_or_none():
             case = db.execute(select(DelayCase).where(DelayCase.case_no == "CASE-TRI-002")).scalar_one()
             db.add(DispatchAction(case_id=case.id, action_type="查验单证补录", assignee="海关联络岗", due_at=dt(21, 10), status="queued", instruction="等查验结束后补传查验回执"))
+        if not db.execute(select(ThresholdVersion)).scalars().first():
+            db.add(ThresholdVersion(version=1, value=0.6, note="白班标准门槛，夜班可发布更高版本", published_by="supervisor"))
         db.commit()
     finally:
         db.close()

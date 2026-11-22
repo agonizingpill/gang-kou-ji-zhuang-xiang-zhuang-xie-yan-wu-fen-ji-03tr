@@ -7,8 +7,9 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import select
-from .database import Base, SessionLocal, engine
+from .database import Base, SessionLocal, engine, ensure_schema_upgrades
 from .models import AnalysisJob, DelayCase
+from .thresholds import STATUS_FAILED, evaluate
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 SHARED_DIR = Path(os.getenv("SHARED_DIR", "/shared"))
@@ -63,17 +64,27 @@ def run_job(job_id):
         probs = MODEL.predict_proba(x)[0]
         classes = MODEL.named_steps["lr"].classes_
         confidence = float(max(probs))
-        result = {"label": label, "confidence": round(confidence, 4), "probabilities": {c: round(float(p), 4) for c, p in zip(classes, probs)}, "feature_keys": FEATURE_KEYS, "features": f, "formula": "手工交叉特征 = avg_gate_dwell_min×reefer_ratio, gate_event_count×container_count；StandardScaler + LogisticRegression(random_state=42)"}
+        # 按案件受理时绑定的门槛快照裁决：达标照常分级派工，低于门槛交主管核级
+        verdict = evaluate(confidence, case.threshold_value)
+        result = {"label": label, "confidence": round(confidence, 4), "probabilities": {c: round(float(p), 4) for c, p in zip(classes, probs)}, "feature_keys": FEATURE_KEYS, "features": f, "threshold_version": case.threshold_version, "threshold_value": case.threshold_value, "verdict": verdict, "formula": "手工交叉特征 = avg_gate_dwell_min×reefer_ratio, gate_event_count×container_count；StandardScaler + LogisticRegression(random_state=42)"}
         job.result = result; job.status = "succeeded"; job.finished_at = datetime.now(timezone.utc)
-        case.model_output = result; case.final_level = label; case.status = "classified"; case.exception_reason = None
+        case.model_output = result; case.exception_reason = None
+        if verdict == "classified":
+            case.final_level = label; case.status = "classified"
+        else:
+            case.final_level = None; case.status = "review"
         db.commit()
     except Exception as exc:
-        job.status = "failed"; job.error = str(exc); job.finished_at = datetime.now(timezone.utc); db.commit()
+        job.status = "failed"; job.error = str(exc); job.finished_at = datetime.now(timezone.utc)
+        if case is not None:
+            case.status = STATUS_FAILED  # 保留原门槛版本，重试不换版
+        db.commit()
     finally:
         db.close()
 
 def main():
     Base.metadata.create_all(engine)
+    ensure_schema_upgrades()
     SHARED_DIR.mkdir(parents=True, exist_ok=True)
     while True:
         Path(SHARED_DIR / "worker-heartbeat").touch()
